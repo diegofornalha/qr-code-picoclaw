@@ -93,8 +93,9 @@ export default function QRCodePage() {
     })
 
     es.addEventListener('done', () => {
-      checkStatus()
       es.close()
+      setStatus('disconnected')
+      setMessage('Gateway encerrado. Clique em Conectar para tentar novamente.')
     })
 
     es.onerror = () => {

@@ -1,19 +1,6 @@
 import { spawn } from 'child_process'
-import { readFile } from 'fs/promises'
-import { join } from 'path'
 
-const PICOCLAW_BIN = process.env.PICOCLAW_BIN || '/Users/2a/.claude/batalha/picoclaw/build/picoclaw-darwin-arm64'
-
-async function getLinkedNumber(): Promise<string | null> {
-  try {
-    const home = process.env.HOME || '/root'
-    const credsPath = join(home, '.picoclaw', 'credentials', 'whatsapp', 'default', 'creds.json')
-    const creds = JSON.parse(await readFile(credsPath, 'utf-8'))
-    const jid = creds?.me?.id
-    if (!jid) return null
-    return '+' + jid.split(':')[0]
-  } catch { return null }
-}
+const WACLI_BIN = process.env.WACLI_PATH || '/root/.local/bin/wacli'
 
 export const dynamic = 'force-dynamic'
 
@@ -26,23 +13,22 @@ export async function GET() {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
       }
 
-      // Kill existing gateway
-      try { require('child_process').execSync('pkill -f "picoclaw-darwin-arm64 gateway" 2>/dev/null || true') } catch {}
+      // Kill any existing wacli auth process
+      try { require('child_process').execSync('pkill -f "wacli auth$" 2>/dev/null || true') } catch {}
 
-      const proc = spawn(PICOCLAW_BIN, ['gateway'], {
-        env: { ...process.env, HOME: process.env.HOME || '/root' },
+      const proc = spawn(WACLI_BIN, ['auth'], {
+        env: { ...process.env },
       })
 
       let qrLines: string[] = []
       let capturing = false
-      let sent = false
-      let bannerDone = false
       let qrFlushTimer: ReturnType<typeof setTimeout> | null = null
+      let qrSent = false
 
       function flushQr() {
-        if (qrLines.length > 10) {
+        if (qrLines.length > 5) {
           send('qr', { qr: qrLines.join('\n') })
-          sent = true
+          qrSent = true
         }
         qrLines = []
         capturing = false
@@ -52,52 +38,42 @@ export async function GET() {
         const clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\r/g, '').trim()
         if (!clean) return
 
-        // Skip ASCII banner
-        if (/[╗╔═║╚╝]/.test(clean)) return
-
-        // Wait for gateway ready
-        if (!bannerDone) {
-          if (/Gateway started/i.test(clean)) {
-            bannerDone = true
-            send('log', { text: 'Gateway iniciado. Aguardando QR code...' })
-          }
+        // Auth start
+        if (/Starting authentication/i.test(clean)) {
+          send('log', { text: 'Gerando QR Code...' })
           return
         }
 
-        // QR detection
-        const hasBlock = /[▄▀█▌▐]/.test(clean)
-        const hasText = /[a-zA-Z0-9:✓•📦⚡🦞]/.test(clean)
-        const isQr = clean.length > 15 && hasBlock && !hasText
-
-        if (!capturing && isQr) {
+        // Scan instruction line — start capturing QR after this
+        if (/Scan this QR/i.test(clean)) {
           capturing = true
-          qrLines = [clean]
-          // Flush after 2s of silence (gateway stops printing after QR)
-          if (qrFlushTimer) clearTimeout(qrFlushTimer)
-          qrFlushTimer = setTimeout(flushQr, 2000)
+          qrLines = []
           return
         }
 
+        // QR code lines (block characters)
         if (capturing) {
-          if (isQr) {
+          const hasBlock = /[█▄▀▌▐]/.test(clean)
+          if (hasBlock) {
             qrLines.push(clean)
-            // Reset flush timer
             if (qrFlushTimer) clearTimeout(qrFlushTimer)
-            qrFlushTimer = setTimeout(flushQr, 2000)
+            qrFlushTimer = setTimeout(flushQr, 1500)
+            return
           } else {
             if (qrFlushTimer) clearTimeout(qrFlushTimer)
             flushQr()
           }
-          if (capturing) return
         }
 
-        // Connection success
-        if (/linked|logged in|successfully|paired|authenticated|syncing|sync complete|bootstrap/i.test(clean)) {
-          send('connected', { message: 'Vinculado! WhatsApp conectado.' })
-          ;(async () => {
-            const phone = await getLinkedNumber()
-            if (phone) send('log', { text: `Numero: ${phone}` })
-          })()
+        // Success
+        if (/logged in|authenticated|connected|syncing|paired/i.test(clean)) {
+          send('connected', { message: 'WhatsApp conectado com sucesso!' })
+          return
+        }
+
+        // Any other text line
+        if (clean.length > 0 && !qrSent) {
+          send('log', { text: clean })
         }
       }
 
