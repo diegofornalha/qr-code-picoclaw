@@ -1,10 +1,18 @@
 import { spawn } from 'child_process'
+import path from 'path'
 
 const WACLI_BIN = process.env.WACLI_PATH || '/root/.local/bin/wacli'
+const STORE_BASE = process.env.WACLI_STORE_BASE || process.env.WACLI_STORE || '/root/.picoclaw/credentials/whatsapp/default'
 
 export const dynamic = 'force-dynamic'
 
-export async function GET() {
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const slotNum = parseInt(searchParams.get('slot') || '1', 10)
+  const slotName = `whatsapp_${slotNum}`
+  const slotDir = path.join(STORE_BASE, String(slotNum))
+  const storeConnStr = `file:${path.join(slotDir, 'store.db')}?_foreign_keys=on`
+
   const encoder = new TextEncoder()
 
   const stream = new ReadableStream({
@@ -13,11 +21,14 @@ export async function GET() {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
       }
 
-      // Kill any existing wacli auth process
-      try { require('child_process').execSync('pkill -f "wacli auth$" 2>/dev/null || true') } catch {}
+      // Kill any existing wacli auth for this slot
+      try { require('child_process').execSync(`pkill -f "wacli auth$" 2>/dev/null || true`) } catch {}
+
+      // Ensure slot directory exists
+      try { require('fs').mkdirSync(slotDir, { recursive: true }) } catch {}
 
       const proc = spawn(WACLI_BIN, ['auth'], {
-        env: { ...process.env },
+        env: { ...process.env, WACLI_STORE_PATH: storeConnStr },
       })
 
       let qrLines: string[] = []
@@ -27,7 +38,12 @@ export async function GET() {
 
       function flushQr() {
         if (qrLines.length > 5) {
-          send('qr', { qr: qrLines.join('\n') })
+          send('code', {
+            slot_number: slotNum,
+            slot_name: slotName,
+            event: 'code',
+            code: qrLines.join('\n'),
+          })
           qrSent = true
         }
         qrLines = []
@@ -38,20 +54,17 @@ export async function GET() {
         const clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\r/g, '').trim()
         if (!clean) return
 
-        // Auth start
         if (/Starting authentication/i.test(clean)) {
-          send('log', { text: 'Gerando QR Code...' })
+          send('log', { slot_number: slotNum, slot_name: slotName, text: 'Gerando QR Code...' })
           return
         }
 
-        // Scan instruction line — start capturing QR after this
         if (/Scan this QR/i.test(clean)) {
           capturing = true
           qrLines = []
           return
         }
 
-        // QR code lines (block characters)
         if (capturing) {
           const hasBlock = /[█▄▀▌▐]/.test(clean)
           if (hasBlock) {
@@ -65,17 +78,20 @@ export async function GET() {
           }
         }
 
-        // Success
         if (/logged in|authenticated|connected|syncing|paired/i.test(clean)) {
-          send('connected', { message: 'WhatsApp conectado com sucesso!' })
+          send('connected', {
+            slot_number: slotNum,
+            slot_name: slotName,
+            event: 'success',
+            message: `Slot ${slotNum} conectado com sucesso!`,
+          })
           // Kill wacli immediately so it doesn't conflict with the gateway
           proc.kill('SIGTERM')
           return
         }
 
-        // Any other text line
         if (clean.length > 0 && !qrSent) {
-          send('log', { text: clean })
+          send('log', { slot_number: slotNum, slot_name: slotName, text: clean })
         }
       }
 
@@ -92,12 +108,12 @@ export async function GET() {
 
       proc.on('close', (code) => {
         if (capturing) flushQr()
-        send('done', { code })
+        send('done', { slot_number: slotNum, slot_name: slotName, code })
         controller.close()
       })
 
       proc.on('error', (err) => {
-        send('error', { message: err.message })
+        send('error', { slot_number: slotNum, slot_name: slotName, message: err.message })
         controller.close()
       })
 
@@ -107,6 +123,10 @@ export async function GET() {
   })
 
   return new Response(stream, {
-    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
   })
 }
